@@ -1,4 +1,15 @@
-"""Roaming King Titan monitor - polls RCON GetGameLog on Extinction servers."""
+"""Roaming King Titan monitor - uses EOS matchmaking snapshots to detect
+roaming King Titan events on all official ASA Small Tribes Extinction servers.
+
+No RCON required - hooks into the existing Poller snapshot data.
+
+Detection strategy:
+  Official Extinction sessions expose a 'RoamingBossActive_i' (or similar)
+  attribute when the roaming King Titan is up. We also check the
+  CUSTOMSERVERNAME_s for known titan-event suffixes as a fallback.
+  On every Poller tick we compare the current EOS snapshot against our
+  previous state and fire TitanEvent callbacks on transitions.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,32 +17,61 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Dict, List, Optional
 
-from config import RconServer
-from core.rcon.client import RconClient
+from core.eos.matchmaking import EOSSession
 
 log = logging.getLogger(__name__)
 
-# Patterns in the ARK ShooterGame log for the roaming King Titan
-# The roaming boss triggers when ASA spawns it at the scheduled daily time.
-# We match lines that indicate the creature appearing/despawning in the world.
-SPAWN_PATTERNS = [
-    re.compile(r"KingKaiju.*?(?:Spawned|AddToWorld|BeginPlay)", re.IGNORECASE),
-    re.compile(r"RoamingBoss.*?(?:Spawned|AddToWorld|BeginPlay)", re.IGNORECASE),
-    re.compile(r"(?:Spawned|AddToWorld).*?KingKaiju", re.IGNORECASE),
-]
-DESPAWN_PATTERNS = [
-    re.compile(r"KingKaiju.*?(?:Destroyed|EndPlay|Died|Death)", re.IGNORECASE),
-    re.compile(r"RoamingBoss.*?(?:Destroyed|EndPlay|Died|Death)", re.IGNORECASE),
-    re.compile(r"(?:Destroyed|EndPlay|Died).*?KingKaiju", re.IGNORECASE),
-]
+# Map name patterns that identify Extinction sessions
+EXT_MAP_RE = re.compile(r"extinction", re.IGNORECASE)
+
+# EOS session attribute keys that signal the roaming King Titan is active.
+# Wildcard Studio typically uses these attribute names in official sessions.
+TITAN_ACTIVE_ATTRS = {
+    "RoamingBossActive_i",
+    "RoamingBossActive_b",
+    "RoamingKingTitanActive_i",
+    "RoamingKingTitanActive_b",
+    "EventActive_i",
+}
+
+# Fallback: server name substrings that indicate an active roaming titan event
+# (Wildcard sometimes appends e.g. "[KingTitan]" or "- RoamingBoss" to the name)
+TITAN_NAME_RE = re.compile(
+    r"(?:KingTitan|RoamingBoss|RoamingKingTitan|KingKaiju)",
+    re.IGNORECASE,
+)
+
+
+def _session_has_titan(sess: EOSSession) -> bool:
+    """Return True if this EOS session's attributes indicate an active roaming King Titan."""
+    attrs: dict = sess.raw.get("attributes", {})
+
+    # Check known boolean/integer attribute keys
+    for key in TITAN_ACTIVE_ATTRS:
+        val = attrs.get(key)
+        if val not in (None, 0, False, "0", "false"):
+            return True
+
+    # Fallback: scan ALL attribute values for titan keywords
+    for key, val in attrs.items():
+        if isinstance(val, str) and TITAN_NAME_RE.search(val):
+            return True
+
+    # Final fallback: check the server name itself
+    if TITAN_NAME_RE.search(sess.server_name):
+        return True
+
+    return False
 
 
 @dataclass
 class TitanEvent:
+    session_id: str
     server_name: str
-    present: bool          # True = spawned, False = despawned/killed
+    map_name: str
+    present: bool          # True = titan spawned, False = titan gone
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -39,87 +79,68 @@ TitanCallback = Callable[[TitanEvent], Awaitable[None]]
 
 
 class TitanMonitor:
-    """Per-interval RCON log poller that detects roaming King Titan spawn/despawn."""
+    """Watches EOS snapshot diffs for roaming King Titan events on all Extinction servers.
+
+    Usage - call process_snapshot() on every Poller tick with the current
+    Dict[session_id, EOSSession] snapshot.  Fires TitanEvent callbacks
+    whenever a titan appears or disappears on any Extinction server.
+    """
 
     def __init__(self) -> None:
         self._callbacks: list[TitanCallback] = []
-        self._task: Optional[asyncio.Task] = None
-        # Track titan presence per server name
-        self._state: dict[str, bool] = {}  # server_name -> is_titan_present
-        # Track last seen log lines per server to avoid re-processing
-        self._seen_lines: dict[str, set[str]] = {}
+        # Per session_id: True = titan currently active
+        self._state: Dict[str, bool] = {}
 
     def add_callback(self, cb: TitanCallback) -> None:
         self._callbacks.append(cb)
 
-    def start(self, servers: list[RconServer], interval: int = 120) -> None:
-        """Start the polling loop. interval is in seconds (default 2 min)."""
-        if self._task and not self._task.done():
-            return
-        self._servers = servers
-        self._interval = interval
-        self._task = asyncio.create_task(self._loop())
-        log.info("TitanMonitor started for %d servers, interval=%ds", len(servers), interval)
+    async def process_snapshot(self, snapshot: Dict[str, EOSSession]) -> None:
+        """Called with the latest EOS snapshot on every poller tick."""
+        # Only care about Extinction sessions
+        ext_sessions: Dict[str, EOSSession] = {
+            sid: sess
+            for sid, sess in snapshot.items()
+            if EXT_MAP_RE.search(sess.map_name or "")
+        }
 
-    def stop(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-            log.info("TitanMonitor stopped")
+        # Detect sessions that have left the snapshot (server gone) -
+        # if titan was active on them, fire a 'gone' event
+        for sid in list(self._state.keys()):
+            if self._state[sid] and sid not in ext_sessions:
+                await self._fire(sid, "<offline>", "Extinction", present=False)
+                del self._state[sid]
 
-    async def _loop(self) -> None:
-        while True:
+        # Check every live Extinction session
+        for sid, sess in ext_sessions.items():
+            now_active = _session_has_titan(sess)
+            was_active = self._state.get(sid, False)
+
+            if now_active != was_active:
+                self._state[sid] = now_active
+                await self._fire(sid, sess.server_name, sess.map_name, present=now_active)
+
+            elif sid not in self._state:
+                # First time we see this session - record state without firing
+                self._state[sid] = now_active
+
+    async def _fire(self, sid: str, name: str, map_name: str, present: bool) -> None:
+        event = TitanEvent(
+            session_id=sid,
+            server_name=name,
+            map_name=map_name,
+            present=present,
+        )
+        log.info(
+            "TitanMonitor: %s on %s (%s)",
+            "SPAWN" if present else "GONE",
+            name,
+            sid,
+        )
+        for cb in self._callbacks:
             try:
-                await self._tick()
-            except asyncio.CancelledError:
-                break
+                await cb(event)
             except Exception as exc:
-                log.exception("TitanMonitor tick error: %s", exc)
-            await asyncio.sleep(self._interval)
-
-    async def _tick(self) -> None:
-        for server in self._servers:
-            try:
-                await self._poll_server(server)
-            except Exception as exc:
-                log.warning("TitanMonitor: error polling %s: %s", server.name, exc)
-
-    async def _poll_server(self, server: RconServer) -> None:
-        client = RconClient(server)
-        raw = await client.send("GetGameLog")
-        if not raw:
-            return
-
-        lines = raw.splitlines()
-        seen = self._seen_lines.setdefault(server.name, set())
-        new_lines = [ln for ln in lines if ln not in seen]
-        seen.update(lines)
-
-        if not new_lines:
-            return
-
-        was_present = self._state.get(server.name, False)
-        now_present = was_present
-
-        for line in new_lines:
-            if not was_present:
-                if any(p.search(line) for p in SPAWN_PATTERNS):
-                    now_present = True
-                    log.info("[%s] Roaming King Titan SPAWNED detected: %s", server.name, line[:120])
-                    break
-            if was_present:
-                if any(p.search(line) for p in DESPAWN_PATTERNS):
-                    now_present = False
-                    log.info("[%s] Roaming King Titan GONE detected: %s", server.name, line[:120])
-                    break
-
-        if now_present != was_present:
-            self._state[server.name] = now_present
-            event = TitanEvent(server_name=server.name, present=now_present)
-            for cb in self._callbacks:
-                try:
-                    await cb(event)
-                except Exception as exc:
-                    log.exception("TitanMonitor callback error: %s", exc)
+                log.exception("TitanMonitor callback error: %s", exc)
 
 
 # Singleton
