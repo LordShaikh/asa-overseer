@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     discord_token: str
     guild_id: int
     log_channel_id: int
+        titan_channel_id: Optional[int] = Field(default=None)
 
     # EOS
     eos_client_id: str
